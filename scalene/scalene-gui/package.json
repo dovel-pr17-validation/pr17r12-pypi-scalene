@@ -3,7 +3,7 @@
     "@aws-sdk/client-bedrock": "^3.687.0",
     "buffer": "^6.0.3",
     "@aws-sdk/client-bedrock-runtime": "^3.687.0",
-    "@aws-sdk/credential-provider-cognito-identity": "^3.687.0",
+    "@aws-sdk/credential-provider-cognito-identity": "^3.972.75",
     "@aws-sdk/credential-provider-web-identity": "^3.686.0",
     "@aws-sdk/protocol-http": "^3.374.0",
     "@aws-sdk/signature-v4": "^3.374.0",
