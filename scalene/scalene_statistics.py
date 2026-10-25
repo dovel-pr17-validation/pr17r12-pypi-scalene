@@ -1,0 +1,1089 @@
+from __future__ import annotations
+
+import os
+import pathlib
+import pickle
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from functools import total_ordering
+from typing import (
+    Any,
+    List,
+    NewType,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
+
+import cloudpickle
+from pydantic import PositiveInt
+
+from scalene.hyperloglog import HyperLogLog
+from scalene.runningstats import RunningStats
+from scalene.scalene_config import (
+    CPU_SAMPLES_RESERVOIR_SIZE,
+    MEMORY_FOOTPRINT_RESERVOIR_SIZE,
+)
+from scalene.sorted_reservoir import sorted_reservoir
+
+Address = NewType("Address", str)
+Filename = NewType("Filename", str)
+LineNumber = NewType("LineNumber", PositiveInt)
+ByteCodeIndex = NewType("ByteCodeIndex", int)
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class PyFrameKey:
+    """A Python frame in a stitched stack, as captured at sample time.
+
+    Frozen so instances are hashable and usable as parts of dict keys
+    (specifically inside CombinedStackKey tuples used to key
+    ``ScaleneStatistics.combined_stacks``).
+
+    __slots__ keeps each instance at ~200 bytes instead of ~650 bytes
+    (no per-instance __dict__). At the scale of the stitched-stacks
+    timeline this is the single biggest in-process memory win. Manual
+    slots tuple rather than ``slots=True`` because Scalene supports
+    Python 3.8.
+    """
+
+    __slots__ = ("filename", "function", "line")
+    filename: str
+    function: str
+    line: int
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        # Default pickle round-trips frozen+__slots__ dataclasses through
+        # __setstate__, which uses __setattr__ — and that is exactly what
+        # frozen forbids. Reconstruct via __init__ instead so multiprocess
+        # merging (ScaleneStatistics.merge_stats) can unpickle these keys.
+        return (self.__class__, (self.filename, self.function, self.line))
+
+
+@dataclass(frozen=True)
+class NativeFrameKey:
+    """A native (C/C++) frame in a stitched stack, captured as a raw
+    instruction pointer. Symbol resolution happens at report time, not
+    in the signal handler. Frozen for the same reason as PyFrameKey.
+    """
+
+    __slots__ = ("ip",)
+    ip: int
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        # See PyFrameKey.__reduce__ — same reason.
+        return (self.__class__, (self.ip,))
+
+
+# A single frame in a stitched stack — either a Python frame or a native
+# frame. Discriminate with isinstance(frame, PyFrameKey) /
+# isinstance(frame, NativeFrameKey) at use sites.
+CombinedFrameKey = Union[PyFrameKey, NativeFrameKey]
+# A complete stitched stack, outermost-first.
+CombinedStackKey = Tuple[CombinedFrameKey, ...]
+
+
+@dataclass
+class CombinedStackRun:
+    """One run-length-encoded entry in the stitched-stacks timeline.
+
+    A "run" is a contiguous sequence of CPU samples that all hit the same
+    stitched stack. Storing samples this way collapses tight loops (which
+    fire the same stack thousands of times in a row) into a single entry,
+    so the timeline can cover arbitrarily long profiling sessions without
+    truncation.
+
+    Attributes:
+        timestamp: Wallclock seconds at which the first sample of the run
+            was taken. Reported as-is; the JSON serializer normalizes
+            against the first run's timestamp before emitting.
+        stack_key: The stitched stack — same shape as the keys of
+            ``ScaleneStatistics.combined_stacks``.
+        count: Number of consecutive CPU samples in this run.
+        thread_id: Python thread ID (from threading.get_ident()) for the
+            thread that generated this sample. None for legacy data or
+            when thread info is unavailable. Used by the GUI to color-code
+            timeline entries and support per-thread views.
+
+    Non-frozen so ``count`` can be incremented in place when the next
+    sample hits the same stack. __slots__ drops the per-run overhead
+    from ~590 bytes to ~150 bytes, which matters because the timeline
+    can hold up to ``combined_stacks_timeline_max_runs`` (100K) entries.
+    """
+
+    __slots__ = ("timestamp", "stack_key", "count", "thread_id")
+    timestamp: float
+    stack_key: CombinedStackKey
+    count: int
+    thread_id: int | None  # Python thread ID, None for main/unknown
+
+
+@dataclass(frozen=True)
+class PerThreadNativeStack:
+    """A native stack captured from a worker thread via per-thread sampling.
+
+    The per-thread sampler sends SIGPROF to registered worker threads and
+    captures their native stacks into a ring buffer. This dataclass wraps
+    each captured sample with its thread ID for correlation with Python
+    frames.
+
+    Attributes:
+        thread_id: Native thread ID (e.g., from gettid on Linux, pthread_mach_thread_np on macOS).
+        stack: Tuple of instruction pointers, leaf-first (innermost frame first).
+    """
+
+    __slots__ = ("thread_id", "stack")
+    thread_id: int
+    stack: tuple[int, ...]
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        # See PyFrameKey.__reduce__ — same reason.
+        return (self.__class__, (self.thread_id, self.stack))
+
+
+class ProfilingSample:
+    def __init__(
+        self,
+        action: str,
+        alloc_time: int,
+        count: float,
+        python_fraction: float,
+        pointer: Address,
+        filename: Filename,
+        lineno: LineNumber,
+        bytecode_index: ByteCodeIndex,
+        stack: tuple[StackFrame, ...] | None = None,
+    ) -> None:
+        self.action = action
+        self.alloc_time = alloc_time
+        self.count = count
+        self.python_fraction = python_fraction
+        self.pointer = pointer
+        self.filename = filename
+        self.lineno = lineno
+        self.bytecode_index = bytecode_index
+        # Python call stack captured synchronously at allocation time by
+        # whereInPythonWithStack (leaf-first); None when the native side
+        # predates sync-stack capture or stacks weren't requested.
+        self.stack = stack
+
+
+@total_ordering
+class MemcpyProfilingSample:
+    def __init__(
+        self,
+        memcpy_time: int,
+        count: float,
+        filename: Filename,
+        lineno: LineNumber,
+        bytecode_index: ByteCodeIndex,
+    ) -> None:
+        self.memcpy_time = memcpy_time
+        self.count = count
+        self.filename = filename
+        self.lineno = lineno
+        self.bytecode_index = bytecode_index
+
+    def __lt__(self, other: MemcpyProfilingSample) -> bool:
+        """Compare based on memcpy_time for sorting."""
+        return self.memcpy_time < other.memcpy_time
+
+    def __eq__(self, other: object) -> bool:
+        """Compare equality based on all fields."""
+        if not isinstance(other, MemcpyProfilingSample):
+            return NotImplemented
+        return (
+            self.memcpy_time == other.memcpy_time
+            and self.count == other.count
+            and self.filename == other.filename
+            and self.lineno == other.lineno
+            and self.bytecode_index == other.bytecode_index
+        )
+
+
+class StackFrame:
+    """Represents a single frame in the stack.
+
+    __slots__ drops each instance from ~660 bytes to ~80 bytes by
+    eliminating the per-instance __dict__. StackFrame is the element
+    type of ``ScaleneStatistics.memory_stacks`` keys, where every
+    malloc sample that flows through ``process_malloc_free_samples``
+    constructs fresh frames before the dict dedupes by equality.
+    """
+
+    __slots__ = ("filename", "function_name", "line_number")
+
+    def __init__(self, filename: str, function_name: str, line_number: int) -> None:
+        self.filename = filename
+        self.function_name = function_name
+        self.line_number = line_number
+
+    def __repr__(self) -> str:
+        return f"{self.filename} {self.function_name}:{self.line_number};"
+
+    def __hash__(self) -> int:
+        return hash((self.filename, self.function_name, self.line_number))
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, StackFrame):
+            return False
+        return (
+            self.filename == other.filename
+            and self.function_name == other.function_name
+            and self.line_number == other.line_number
+        )
+
+
+class StackStats:
+    """Represents statistics for a stack."""
+
+    __slots__ = ("count", "python_time", "c_time", "cpu_samples")
+
+    def __init__(
+        self, count: int, python_time: float, c_time: float, cpu_samples: float
+    ) -> None:
+        self.count = count
+        self.python_time = python_time
+        self.c_time = c_time
+        self.cpu_samples = cpu_samples
+
+    def __repr__(self) -> str:
+        return f" {self.count}"
+
+
+class CPUStatistics:
+    """Statistics related to CPU usage."""
+
+    def __init__(self) -> None:
+        # CPU samples for each location in the program spent in the interpreter
+        self.cpu_samples_python: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # CPU samples for each location in the program spent in C / libraries / system calls
+        self.cpu_samples_c: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # Running stats for the fraction of time running on the CPU
+        self.cpu_utilization: dict[Any, dict[Any, RunningStats]] = defaultdict(
+            lambda: defaultdict(RunningStats)
+        )
+
+        # Running stats for core utilization
+        self.core_utilization: dict[Any, dict[Any, RunningStats]] = defaultdict(
+            lambda: defaultdict(RunningStats)
+        )
+
+        # Running count of total CPU samples per file. Used to prune reporting
+        self.cpu_samples: dict[Any, float] = defaultdict(float)
+
+        # How many CPU samples have been collected
+        self.total_cpu_samples: float = 0.0
+
+        self.cpu_samples_list: dict[Any, dict[Any, sorted_reservoir]] = defaultdict(
+            lambda: defaultdict(
+                lambda: sorted_reservoir(CPU_SAMPLES_RESERVOIR_SIZE, key=lambda x: x)
+            )
+        )
+
+        # PyTorch operation time per location (in seconds), attributed via torch.profiler
+        # See https://github.com/plasma-umass/scalene/issues/908
+        self.torch_cpu_time: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # PyTorch GPU/CUDA time per location (in seconds), attributed via torch.profiler
+        # Only populated when CUDA is available
+        self.torch_gpu_time: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # JAX operation time per location (in seconds), attributed via jax.profiler
+        self.jax_cpu_time: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # JAX GPU time per location (in seconds)
+        self.jax_gpu_time: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # TensorFlow operation time per location (in seconds), attributed via tf.profiler
+        self.tensorflow_cpu_time: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # TensorFlow GPU time per location (in seconds)
+        self.tensorflow_gpu_time: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+    def clear(self) -> None:
+        """Reset all CPU statistics."""
+        self.cpu_samples_python.clear()
+        self.cpu_samples_c.clear()
+        self.cpu_samples_list.clear()
+        self.cpu_utilization.clear()
+        self.core_utilization.clear()
+        self.cpu_samples.clear()
+        self.total_cpu_samples = 0.0
+        self.torch_cpu_time.clear()
+        self.torch_gpu_time.clear()
+        self.jax_cpu_time.clear()
+        self.jax_gpu_time.clear()
+        self.tensorflow_cpu_time.clear()
+        self.tensorflow_gpu_time.clear()
+
+
+class MemoryStatistics:
+    """Statistics related to memory usage."""
+
+    def __init__(self) -> None:
+        # Total allocation samples taken
+        self.alloc_samples: int = 0
+
+        # Running count of malloc samples per file. Used to prune reporting
+        self.malloc_samples: dict[Any, float] = defaultdict(float)
+
+        # malloc samples for each location in the program
+        self.memory_malloc_samples: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # number of times samples were added for the above
+        self.memory_malloc_count: dict[Any, dict[Any, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
+        # the current footprint for this line
+        self.memory_current_footprint: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # the max footprint for this line
+        self.memory_max_footprint: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # the current high watermark for this line
+        self.memory_current_highwater_mark: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # the aggregate footprint for this line (sum of all final "current"s)
+        self.memory_aggregate_footprint: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # the last malloc to trigger a sample (used for leak detection)
+        self.last_malloc_triggered = (Filename(""), LineNumber(0), Address("0x0"))
+
+        # mallocs attributable to Python, for each location in the program
+        self.memory_python_samples: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # free samples for each location in the program
+        self.memory_free_samples: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # number of times samples were added for the above
+        self.memory_free_count: dict[Any, dict[Any, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
+        # memcpy samples for each location in the program
+        self.memcpy_samples: dict[Any, dict[Any, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
+        # leak score tracking
+        self.leak_score: dict[Any, dict[Any, tuple[int, int]]] = defaultdict(
+            lambda: defaultdict(lambda: ((0, 0)))
+        )
+
+        self.allocation_velocity: tuple[float, float] = (0.0, 0.0)
+
+        # Total memory samples
+        self.total_memory_malloc_samples: float = 0.0
+        self.total_memory_free_samples: float = 0.0
+
+        # Memory footprint
+        self.current_footprint: float = 0.0
+        self.max_footprint: float = 0.0
+        self.max_footprint_python_fraction: float = 0
+        self.max_footprint_loc: tuple[Filename, LineNumber] | None = None
+
+        # Memory footprint samples (time, footprint), bounded via reservoir sampling
+        self.memory_footprint_samples: sorted_reservoir = sorted_reservoir(
+            MEMORY_FOOTPRINT_RESERVOIR_SIZE, key=lambda x: x[0]
+        )
+
+        # Same, but per line
+        self.per_line_footprint_samples: dict[Any, dict[Any, sorted_reservoir]] = (
+            defaultdict(
+                lambda: defaultdict(
+                    lambda: sorted_reservoir(
+                        MEMORY_FOOTPRINT_RESERVOIR_SIZE, key=lambda x: x[0]
+                    )
+                )
+            )
+        )
+
+    def clear(self) -> None:
+        """Reset all memory statistics except for memory footprint."""
+        self.alloc_samples = 0
+        self.malloc_samples.clear()
+        self.memory_malloc_samples.clear()
+        self.memory_malloc_count.clear()
+        self.memory_current_footprint.clear()
+        self.memory_max_footprint.clear()
+        self.memory_current_highwater_mark.clear()
+        self.memory_aggregate_footprint.clear()
+        self.memory_python_samples.clear()
+        self.memory_free_samples.clear()
+        self.memory_free_count.clear()
+        self.memcpy_samples.clear()
+        self.total_memory_malloc_samples = 0.0
+        self.total_memory_free_samples = 0.0
+        self.current_footprint = 0.0
+        self.leak_score.clear()
+        self.last_malloc_triggered = (Filename(""), LineNumber(0), Address("0x0"))
+        self.allocation_velocity = (0.0, 0.0)
+        self.per_line_footprint_samples.clear()
+        # Not clearing current footprint
+        # Not clearing max footprint
+
+    def clear_all(self) -> None:
+        """Clear all memory statistics."""
+        self.clear()
+        self.current_footprint = 0
+        self.max_footprint = 0
+        self.max_footprint_loc = None
+        self.per_line_footprint_samples.clear()
+
+
+class GPUStatistics:
+    """Statistics related to GPU usage."""
+
+    def __init__(self) -> None:
+        # GPU samples for each location in the program
+        self.gpu_samples: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # Number of GPU samples taken (actually weighted by elapsed wallclock time)
+        self.n_gpu_samples: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # GPU memory samples for each location in the program
+        self.gpu_mem_samples: dict[Any, dict[Any, RunningStats]] = defaultdict(
+            lambda: defaultdict(RunningStats)
+        )
+
+        # How many GPU samples have been collected
+        self.total_gpu_samples: float = 0.0
+
+    def clear(self) -> None:
+        """Reset all GPU statistics."""
+        self.gpu_samples.clear()
+        self.n_gpu_samples.clear()
+        self.gpu_mem_samples.clear()
+        self.total_gpu_samples = 0.0
+
+
+class AsyncStatistics:
+    """Statistics related to async/await profiling."""
+
+    def __init__(self) -> None:
+        # Samples where a coroutine was suspended at this line (await-time attribution)
+        self.async_await_samples: dict[Any, dict[Any, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+        # Total async await samples collected
+        self.total_async_await_samples: float = 0.0
+
+        # Map of (filename, lineno) -> set of task names seen suspended there
+        self.async_task_names: dict[Any, dict[Any, set[str]]] = defaultdict(
+            lambda: defaultdict(set)
+        )
+
+        # Whether each function is a coroutine (detected via CO_COROUTINE flag)
+        self.is_coroutine: dict[str, bool] = {}
+
+        # Concurrency tracking: how many tasks were suspended at each sample
+        self.async_concurrency: dict[Any, dict[Any, RunningStats]] = defaultdict(
+            lambda: defaultdict(RunningStats)
+        )
+
+    def clear(self) -> None:
+        """Reset all async statistics."""
+        self.async_await_samples.clear()
+        self.total_async_await_samples = 0.0
+        self.async_task_names.clear()
+        self.is_coroutine.clear()
+        self.async_concurrency.clear()
+
+
+class ScaleneStatistics:
+    @classmethod
+    def _get_payload_contents(cls) -> list[str]:
+        """Generate the list of payload contents programmatically."""
+        contents = []
+
+        # Memory statistics
+        memory_stats = MemoryStatistics()
+        for attr in dir(memory_stats):
+            if not attr.startswith("_") and not callable(getattr(memory_stats, attr)):
+                contents.append(f"memory_stats.{attr}")
+
+        # CPU statistics
+        cpu_stats = CPUStatistics()
+        for attr in dir(cpu_stats):
+            if not attr.startswith("_") and not callable(getattr(cpu_stats, attr)):
+                contents.append(f"cpu_stats.{attr}")
+
+        # GPU statistics
+        gpu_stats = GPUStatistics()
+        for attr in dir(gpu_stats):
+            if not attr.startswith("_") and not callable(getattr(gpu_stats, attr)):
+                contents.append(f"gpu_stats.{attr}")
+
+        # Async statistics
+        async_stats_obj = AsyncStatistics()
+        for attr in dir(async_stats_obj):
+            if not attr.startswith("_") and not callable(
+                getattr(async_stats_obj, attr)
+            ):
+                contents.append(f"async_stats.{attr}")
+
+        # General statistics (attributes directly on ScaleneStatistics)
+        # Create a temporary instance to inspect attributes
+        temp_stats = cls()
+        for attr in dir(temp_stats):
+            # Skip private attributes, callables, and attributes that are already covered by stats classes
+            if (
+                not attr.startswith("_")
+                and not callable(getattr(temp_stats, attr))
+                and not attr.startswith(
+                    ("memory_stats", "cpu_stats", "gpu_stats", "async_stats")
+                )
+                and attr not in ("start_time", "payload_contents")
+            ):
+                contents.append(attr)
+
+        # Ensure we have all the required fields in the correct order
+        required_fields = [
+            "memory_stats.max_footprint",
+            "memory_stats.max_footprint_loc",
+            "memory_stats.current_footprint",
+            "elapsed_time",
+            "memory_stats.alloc_samples",
+            "stacks",
+            "native_stacks",
+            "combined_stacks",
+            "combined_stacks_unique_seen",
+            "combined_stacks_hll",
+            "combined_stacks_timeline",
+            "memory_stacks",
+            "cpu_stats.total_cpu_samples",
+            "cpu_stats.cpu_samples_c",
+            "cpu_stats.cpu_samples_python",
+            "bytei_map",
+            "cpu_stats.cpu_samples",
+            "cpu_stats.cpu_utilization",
+            "cpu_stats.core_utilization",
+            "memory_stats.memory_malloc_samples",
+            "memory_stats.memory_python_samples",
+            "memory_stats.memory_free_samples",
+            "memory_stats.memcpy_samples",
+            "memory_stats.memory_max_footprint",
+            "memory_stats.per_line_footprint_samples",
+            "memory_stats.total_memory_free_samples",
+            "memory_stats.total_memory_malloc_samples",
+            "memory_stats.memory_footprint_samples",
+            "function_map",
+            "firstline_map",
+            "gpu_stats.gpu_samples",
+            "gpu_stats.n_gpu_samples",
+            "gpu_stats.gpu_mem_samples",
+            "gpu_stats.total_gpu_samples",
+            "memory_stats.memory_malloc_count",
+            "memory_stats.memory_free_count",
+        ]
+
+        # Add any missing required fields
+        for field in required_fields:
+            if field not in contents:
+                contents.append(field)
+
+        # Sort to ensure consistent order
+        contents.sort()
+
+        return contents
+
+    # Initialize payload_contents after class definition
+    payload_contents: list[str] = []
+
+    def __init__(self) -> None:
+        # time the profiling started
+        self.start_time: float = 0
+
+        # total time spent in program being profiled
+        self.elapsed_time: float = 0
+
+        # absolute start time (time.time())
+        self.start_time_absolute: float = 0
+
+        # perf_counter start time
+        self.start_time_perf: float = 0
+
+        # full stacks taken during CPU samples, together with number of hits
+        self.stacks: dict[Any, StackStats] = defaultdict(
+            lambda: StackStats(0, 0.0, 0.0, 0.0)
+        )
+
+        # Native (C/C++) stacks captured during CPU samples. Keyed by a tuple
+        # of raw instruction pointers (innermost-first). Symbol resolution
+        # happens at report time, not in the signal handler.
+        self.native_stacks: dict[tuple[int, ...], int] = defaultdict(int)
+
+        # Stitched Python+native stacks captured during CPU samples, together
+        # with hit count. Each stack is a CombinedStackKey: a tuple of tagged
+        # frame tuples (outermost-first). Native IPs are resolved (and
+        # CPython runtime tail trimmed) at report time, mirroring how
+        # native_stacks is handled.
+        #
+        # Capped at ``_COMBINED_STACKS_MAX_KEYS`` entries via the Space-Saving
+        # heavy-hitter sketch (Metwally, Agrawal, El Abbadi 2005): when the
+        # table is full and a new key arrives, the minimum-count entry is
+        # evicted and the new key seats with ``count = old_min + 1``. This
+        # deterministically retains the stacks that actually dominate the
+        # profile (any stack with true frequency > N/cap is guaranteed to
+        # survive), which is what a flame chart cares about. Counts can
+        # over-estimate by at most ``old_min``, the smallest count ever
+        # evicted, which stays small unless the table is being firehosed
+        # with one-offs.
+        self.combined_stacks: dict[CombinedStackKey, int] = defaultdict(int)
+
+        # Total unique stack keys ever observed in this process, including
+        # any evicted by Space-Saving. Used to drive merge accounting and
+        # to corroborate the HLL estimate below.
+        self.combined_stacks_unique_seen: int = 0
+
+        # HyperLogLog estimator (Flajolet et al. 2007) of the true number
+        # of distinct stitched stacks the program ever produced — including
+        # ones that were evicted from the Space-Saving table. Lets the GUI
+        # show "showing the top 10,000 of ~N unique stacks" honestly,
+        # rather than silently bounding the displayed set to the cap. ~4 KB
+        # at p=12, standard error ~1.6%; merges across subprocesses by
+        # register-wise max so the multiprocess estimate stays unbiased.
+        self.combined_stacks_hll: HyperLogLog = HyperLogLog()
+
+        # Run-length-encoded per-sample timeline of stitched stacks for the
+        # experimental timeline view. Consecutive identical stacks collapse
+        # into one CombinedStackRun, so a tight loop firing the same stack
+        # thousands of times in a row is one entry. A soft cap protects
+        # against pathological cases where every sample differs.
+        self.combined_stacks_timeline: list[CombinedStackRun] = []
+        self.combined_stacks_timeline_max_runs = 100000
+
+        # Python call stacks captured at malloc-sample time, weighted by the
+        # bytes attributed to each sampled allocation (in MB). Populated only
+        # when both --memory and --stacks are enabled. Used to render a
+        # memory-weighted flame chart.
+        self.memory_stacks: dict[tuple[StackFrame, ...], float] = defaultdict(float)
+
+        # Initialize statistics classes
+        self.cpu_stats = CPUStatistics()
+        self.memory_stats = MemoryStatistics()
+        self.gpu_stats = GPUStatistics()
+        self.async_stats = AsyncStatistics()
+
+        # maps byte indices to line numbers (collected at runtime)
+        # [filename][lineno] -> set(byteindex)
+        self.bytei_map: dict[Any, dict[Any, set[ByteCodeIndex]]] = defaultdict(
+            lambda: defaultdict(set)
+        )
+
+        # maps filenames and line numbers to functions (collected at runtime)
+        # [filename][lineno] -> function name
+        self.function_map: dict[Any, dict[Any, Filename]] = defaultdict(
+            lambda: defaultdict(lambda: Filename(""))
+        )
+        self.firstline_map: dict[Any, LineNumber] = defaultdict(lambda: LineNumber(1))
+
+    def clear(self) -> None:
+        """Reset all statistics except for memory footprint."""
+        self.start_time = 0
+        self.elapsed_time = 0
+        self.stacks.clear()
+        self.native_stacks.clear()
+        self.combined_stacks.clear()
+        self.combined_stacks_unique_seen = 0
+        self.combined_stacks_hll.clear()
+        self.combined_stacks_timeline.clear()
+        self.memory_stacks.clear()
+        self.cpu_stats.clear()
+        self.memory_stats.clear()
+        self.gpu_stats.clear()
+        self.async_stats.clear()
+        self.bytei_map.clear()
+
+    def clear_all(self) -> None:
+        """Clear all statistics."""
+        self.clear()
+        self.memory_stats.clear_all()
+
+    def start_clock(self) -> None:
+        """Start the timer."""
+        self.start_time = time.time()
+        self.start_time_absolute = time.time()
+        self.start_time_perf = time.perf_counter()
+
+    def stop_clock(self) -> None:
+        """Stop the timer."""
+        if self.start_time > 0:
+            self.elapsed_time += time.time() - self.start_time
+        self.start_time = 0
+
+    def build_function_stats(self, filename: Filename) -> ScaleneStatistics:
+        """Produce aggregated statistics for each function."""
+        fn_stats = ScaleneStatistics()
+        fn_stats.elapsed_time = self.elapsed_time
+        fn_stats.cpu_stats.total_cpu_samples = self.cpu_stats.total_cpu_samples
+        fn_stats.gpu_stats.total_gpu_samples = self.gpu_stats.total_gpu_samples
+        fn_stats.gpu_stats.n_gpu_samples = self.gpu_stats.n_gpu_samples
+        fn_stats.memory_stats.total_memory_malloc_samples = (
+            self.memory_stats.total_memory_malloc_samples
+        )
+        fn_stats.async_stats.total_async_await_samples = (
+            self.async_stats.total_async_await_samples
+        )
+        first_line_no = LineNumber(1)
+        fn_stats.function_map = self.function_map
+        fn_stats.firstline_map = self.firstline_map
+        for line_no in self.function_map[filename]:
+            fn_name = self.function_map[filename][line_no]
+            if fn_name == "<module>":
+                continue
+
+            fn_stats.cpu_stats.cpu_samples_c[fn_name][
+                first_line_no
+            ] += self.cpu_stats.cpu_samples_c[filename][line_no]
+            fn_stats.cpu_stats.cpu_samples_python[fn_name][
+                first_line_no
+            ] += self.cpu_stats.cpu_samples_python[filename][line_no]
+            fn_stats.gpu_stats.gpu_samples[fn_name][
+                first_line_no
+            ] += self.gpu_stats.gpu_samples[filename][line_no]
+            fn_stats.gpu_stats.n_gpu_samples[fn_name][
+                first_line_no
+            ] += self.gpu_stats.n_gpu_samples[filename][line_no]
+            fn_stats.gpu_stats.gpu_mem_samples[fn_name][
+                first_line_no
+            ] += self.gpu_stats.gpu_mem_samples[filename][line_no]
+            fn_stats.cpu_stats.cpu_utilization[fn_name][
+                first_line_no
+            ] += self.cpu_stats.cpu_utilization[filename][line_no]
+            fn_stats.cpu_stats.core_utilization[fn_name][
+                first_line_no
+            ] += self.cpu_stats.core_utilization[filename][line_no]
+            fn_stats.memory_stats.per_line_footprint_samples[fn_name][
+                first_line_no
+            ] += self.memory_stats.per_line_footprint_samples[filename][line_no]
+            fn_stats.memory_stats.memory_malloc_count[fn_name][
+                first_line_no
+            ] += self.memory_stats.memory_malloc_count[filename][line_no]
+            fn_stats.memory_stats.memory_free_count[fn_name][
+                first_line_no
+            ] += self.memory_stats.memory_free_count[filename][line_no]
+            fn_stats.memory_stats.memory_malloc_samples[fn_name][
+                first_line_no
+            ] += self.memory_stats.memory_malloc_samples[filename][line_no]
+            fn_stats.memory_stats.memory_python_samples[fn_name][
+                first_line_no
+            ] += self.memory_stats.memory_python_samples[filename][line_no]
+            fn_stats.memory_stats.memory_free_samples[fn_name][
+                first_line_no
+            ] += self.memory_stats.memory_free_samples[filename][line_no]
+            for index in self.bytei_map[filename][line_no]:
+                fn_stats.bytei_map[fn_name][first_line_no].add(
+                    ByteCodeIndex(index)  # was 0
+                )
+            fn_stats.memory_stats.memcpy_samples[fn_name][
+                first_line_no
+            ] += self.memory_stats.memcpy_samples[filename][line_no]
+            fn_stats.memory_stats.leak_score[fn_name][first_line_no] = (
+                fn_stats.memory_stats.leak_score[fn_name][first_line_no][0]
+                + self.memory_stats.leak_score[filename][line_no][0],
+                fn_stats.memory_stats.leak_score[fn_name][first_line_no][1]
+                + self.memory_stats.leak_score[filename][line_no][1],
+            )
+            fn_stats.memory_stats.memory_max_footprint[fn_name][first_line_no] = max(
+                fn_stats.memory_stats.memory_max_footprint[fn_name][first_line_no],
+                self.memory_stats.memory_max_footprint[filename][line_no],
+            )
+            fn_stats.memory_stats.memory_aggregate_footprint[fn_name][
+                first_line_no
+            ] += self.memory_stats.memory_aggregate_footprint[filename][line_no]
+            # Async await samples
+            fn_stats.async_stats.async_await_samples[fn_name][
+                first_line_no
+            ] += self.async_stats.async_await_samples[filename][line_no]
+            # Async concurrency
+            concurrency = self.async_stats.async_concurrency[filename][line_no]
+            if concurrency.size() > 0:
+                fn_stats.async_stats.async_concurrency[fn_name][first_line_no] = (
+                    fn_stats.async_stats.async_concurrency[fn_name][first_line_no]
+                    + concurrency
+                )
+            # Async task names
+            task_names = self.async_stats.async_task_names[filename][line_no]
+            if task_names:
+                fn_stats.async_stats.async_task_names[fn_name][first_line_no].update(
+                    task_names
+                )
+
+        return fn_stats
+
+    def output_stats(self, pid: int, dir_name: pathlib.Path) -> None:
+        """Output statistics for a particular process to a given directory."""
+        payload: list[Any] = []
+        for attr_path in ScaleneStatistics.payload_contents:
+            # Split the path into parts
+            parts = attr_path.split(".")
+            # Start with self
+            value = self
+            # Traverse the path
+            for part in parts:
+                value = getattr(value, part)
+            payload.append(value)
+
+        # Create a file in the Python alias directory with the relevant info.
+        out_filename = os.path.join(dir_name, f"scalene{pid}-{str(os.getpid())}")
+        with open(out_filename, "wb") as out_file:
+            cloudpickle.dump(payload, out_file)
+
+    @staticmethod
+    def increment_per_line_samples(
+        dest: dict[Filename, dict[LineNumber, T]],
+        src: dict[Filename, dict[LineNumber, T]],
+    ) -> None:
+        """Increment single-line dest samples by their value in src."""
+        for filename in src:
+            for lineno in src[filename]:
+                v = src[filename][lineno]
+                dest[filename][lineno] += v  # type: ignore
+
+    @staticmethod
+    def increment_cpu_utilization(
+        dest: dict[Filename, dict[LineNumber, RunningStats]],
+        src: dict[Filename, dict[LineNumber, RunningStats]],
+    ) -> None:
+        """Increment CPU utilization."""
+        for filename in src:
+            for lineno in src[filename]:
+                dest[filename][lineno] += src[filename][lineno]
+
+    @staticmethod
+    def increment_core_utilization(
+        dest: dict[Filename, dict[LineNumber, RunningStats]],
+        src: dict[Filename, dict[LineNumber, RunningStats]],
+    ) -> None:
+        """Increment core utilization."""
+        for filename in src:
+            for lineno in src[filename]:
+                dest[filename][lineno] += src[filename][lineno]
+
+    def merge_stats(self, the_dir_name: pathlib.Path) -> None:
+        """Merge all statistics in a given directory."""
+        the_dir = pathlib.Path(the_dir_name)
+        for f in list(the_dir.glob(os.path.join("**", "scalene*"))):
+            # Skip empty files.
+            if os.path.getsize(f) == 0:
+                continue
+            with open(f, "rb") as file:
+                unpickler = pickle.Unpickler(file)
+                try:
+                    value = unpickler.load()
+                except EOFError:
+                    # Empty file for some reason.
+                    continue
+                x = ScaleneStatistics()
+                for i, n in enumerate(ScaleneStatistics.payload_contents):
+                    # Split the path into parts
+                    parts = n.split(".")
+                    # Start with x
+                    target = x
+                    # Traverse the path except the last part
+                    for part in parts[:-1]:
+                        target = getattr(target, part)
+                    # Set the value
+                    setattr(target, parts[-1], value[i])
+
+                if x.memory_stats.max_footprint > self.memory_stats.max_footprint:
+                    self.memory_stats.max_footprint = x.memory_stats.max_footprint
+                    self.memory_stats.max_footprint_loc = (
+                        x.memory_stats.max_footprint_loc
+                    )
+                self.memory_stats.current_footprint = max(
+                    self.memory_stats.current_footprint,
+                    x.memory_stats.current_footprint,
+                )
+                self.cpu_stats.cpu_utilization.update(x.cpu_stats.cpu_utilization)
+                self.cpu_stats.core_utilization.update(x.cpu_stats.core_utilization)
+                self.elapsed_time = max(self.elapsed_time, x.elapsed_time)
+                self.memory_stats.alloc_samples += x.memory_stats.alloc_samples
+                self.stacks.update(x.stacks)
+                for stk, hits in x.native_stacks.items():
+                    self.native_stacks[stk] += hits
+                for cstk, chits in x.combined_stacks.items():
+                    self.combined_stacks[cstk] += chits
+                # Merged unique-seen is an upper bound: keys observed in
+                # both subprocesses get counted twice. That's fine — the
+                # counter is informational; the HLL register merge gives
+                # the actually-deduplicated cardinality estimate.
+                self.combined_stacks_unique_seen += x.combined_stacks_unique_seen
+                # HLL merges by register-wise max, so subprocesses that
+                # touched the same stacks don't double-count — this is
+                # exactly the property that makes HLL useful here.
+                self.combined_stacks_hll.merge(x.combined_stacks_hll)
+                for mstk, mmb in x.memory_stacks.items():
+                    self.memory_stacks[mstk] += mmb
+                # Timelines are interleaved by start time so the merged
+                # timeline reflects the actual chronology across processes.
+                # Cap-aware: each side already obeys its own soft cap, and
+                # we apply the cap once more after merging.
+                if x.combined_stacks_timeline:
+                    merged_timeline: list[CombinedStackRun] = []
+                    a = self.combined_stacks_timeline
+                    b = x.combined_stacks_timeline
+                    i = j = 0
+                    while i < len(a) and j < len(b):
+                        if a[i].timestamp <= b[j].timestamp:
+                            merged_timeline.append(a[i])
+                            i += 1
+                        else:
+                            merged_timeline.append(b[j])
+                            j += 1
+                    merged_timeline.extend(a[i:])
+                    merged_timeline.extend(b[j:])
+                    cap = self.combined_stacks_timeline_max_runs
+                    if len(merged_timeline) > cap:
+                        merged_timeline = merged_timeline[:cap]
+                    self.combined_stacks_timeline = merged_timeline
+                self.cpu_stats.total_cpu_samples += x.cpu_stats.total_cpu_samples
+                self.gpu_stats.total_gpu_samples += x.gpu_stats.total_gpu_samples
+
+                # Restore per-line sample increments
+                self.increment_per_line_samples(
+                    self.cpu_stats.cpu_samples_c, x.cpu_stats.cpu_samples_c
+                )
+                self.increment_per_line_samples(
+                    self.cpu_stats.cpu_samples_python, x.cpu_stats.cpu_samples_python
+                )
+                self.increment_per_line_samples(
+                    self.gpu_stats.gpu_samples, x.gpu_stats.gpu_samples
+                )
+                self.increment_per_line_samples(
+                    self.gpu_stats.n_gpu_samples, x.gpu_stats.n_gpu_samples
+                )
+                self.increment_per_line_samples(
+                    self.gpu_stats.gpu_mem_samples, x.gpu_stats.gpu_mem_samples
+                )
+                self.increment_per_line_samples(
+                    self.memory_stats.memcpy_samples, x.memory_stats.memcpy_samples
+                )
+                self.increment_per_line_samples(
+                    self.memory_stats.per_line_footprint_samples,
+                    x.memory_stats.per_line_footprint_samples,
+                )
+                self.increment_per_line_samples(
+                    self.memory_stats.memory_malloc_count,
+                    x.memory_stats.memory_malloc_count,
+                )
+                self.increment_per_line_samples(
+                    self.memory_stats.memory_malloc_samples,
+                    x.memory_stats.memory_malloc_samples,
+                )
+                self.increment_per_line_samples(
+                    self.memory_stats.memory_python_samples,
+                    x.memory_stats.memory_python_samples,
+                )
+                self.increment_per_line_samples(
+                    self.memory_stats.memory_free_samples,
+                    x.memory_stats.memory_free_samples,
+                )
+                self.increment_per_line_samples(
+                    self.memory_stats.memory_free_count,
+                    x.memory_stats.memory_free_count,
+                )
+
+                # Restore bytei_map and memory_max_footprint handling
+                for filename in x.bytei_map:
+                    for lineno in x.bytei_map[filename]:
+                        v = x.bytei_map[filename][lineno]
+                        self.bytei_map[filename][lineno] |= v
+                        self.memory_stats.memory_max_footprint[filename][lineno] = max(
+                            self.memory_stats.memory_max_footprint[filename][lineno],
+                            x.memory_stats.memory_max_footprint[filename][lineno],
+                        )
+
+                # Restore cpu_samples handling
+                for filename in x.cpu_stats.cpu_samples:
+                    self.cpu_stats.cpu_samples[filename] += x.cpu_stats.cpu_samples[
+                        filename
+                    ]
+
+                # Merge cpu_samples_list (reservoir-sampled wallclock timestamps)
+                self.increment_per_line_samples(
+                    self.cpu_stats.cpu_samples_list, x.cpu_stats.cpu_samples_list
+                )
+
+                self.memory_stats.total_memory_free_samples += (
+                    x.memory_stats.total_memory_free_samples
+                )
+                self.memory_stats.total_memory_malloc_samples += (
+                    x.memory_stats.total_memory_malloc_samples
+                )
+                self.memory_stats.memory_footprint_samples += (
+                    x.memory_stats.memory_footprint_samples
+                )
+
+                # Merge async stats
+                self.increment_per_line_samples(
+                    self.async_stats.async_await_samples,
+                    x.async_stats.async_await_samples,
+                )
+                self.async_stats.total_async_await_samples += (
+                    x.async_stats.total_async_await_samples
+                )
+                # Merge async concurrency stats
+                for fname in x.async_stats.async_concurrency:
+                    for lineno in x.async_stats.async_concurrency[fname]:
+                        self.async_stats.async_concurrency[fname][lineno] = (
+                            self.async_stats.async_concurrency[fname][lineno]
+                            + x.async_stats.async_concurrency[fname][lineno]
+                        )
+
+                # Restore careful function_map handling
+                for k, val in x.function_map.items():
+                    if k in self.function_map:
+                        self.function_map[k].update(val)
+                    else:
+                        self.function_map[k] = val
+                self.firstline_map.update(x.firstline_map)
+            os.remove(f)
+
+
+# Initialize payload_contents after class definition
+ScaleneStatistics.payload_contents = ScaleneStatistics._get_payload_contents()

@@ -1,0 +1,277 @@
+#pragma once
+
+#ifndef __TRACECONFIG_H
+#define __TRACECONFIG_H
+
+#include <Python.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <direct.h>
+#include <stdlib.h>
+#define PATH_MAX _MAX_PATH
+#define realpath(N,R) _fullpath((R),(N),_MAX_PATH)
+#define chdir _chdir
+#define getcwd _getcwd
+#else
+#include <unistd.h>
+#include <limits.h>
+#endif
+
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+class TraceConfig {
+ public:
+  TraceConfig(PyObject* list_wrapper, PyObject* base_path, bool profile_all_b,
+              PyObject* scalene_pkg_path_obj = nullptr) {
+    // Each item is expected to be a str; non-str / non-UTF-8 items are
+    // skipped during decoding below.
+    owner = list_wrapper;
+    path_owner = base_path;
+    Py_IncRef(owner);
+    Py_IncRef(path_owner);
+    profile_all = profile_all_b;
+    auto size = PyList_Size(owner);
+    items.reserve(size);
+    for (Py_ssize_t i = 0; i < size; i++) {
+      auto item = PyList_GetItem(owner, i);  // borrowed reference
+      // Decode each pattern as UTF-8 so non-ASCII values (e.g. "é") are
+      // accepted instead of crashing. PyUnicode_AsUTF8AndSize returns a
+      // pointer into the str's internal buffer (valid while ``owner`` is
+      // alive, which we hold a reference to) and NULL on failure, e.g. for a
+      // non-str list item. On failure we clear the exception and skip the
+      // item rather than dereferencing NULL (the SIGSEGV in #1063). We store
+      // owned std::string copies so the data outlives any transient object.
+      Py_ssize_t len = 0;
+      const char* s = PyUnicode_AsUTF8AndSize(item, &len);
+      if (s == nullptr) {
+        PyErr_Clear();
+        continue;
+      }
+      items.emplace_back(s, len);
+    }
+    {
+      Py_ssize_t len = 0;
+      const char* bp = PyUnicode_AsUTF8AndSize(base_path, &len);
+      if (bp != nullptr) {
+        scalene_base_path = std::string(bp, len);
+      } else {
+        PyErr_Clear();
+      }
+    }
+    // Canonical path of the ``scalene`` package directory, used by
+    // should_trace() to recognize Scalene-internal frames even when the
+    // package lives in a directory not literally named "scalene" (vendoring,
+    // editable installs under symlinks, test layouts, etc.). Optional:
+    // callers that predate this field pass nullptr and we fall back to the
+    // legacy parent-directory-name check alone.
+    if (scalene_pkg_path_obj && scalene_pkg_path_obj != Py_None) {
+      scalene_pkg_path_owner = scalene_pkg_path_obj;
+      Py_IncRef(scalene_pkg_path_owner);
+      // surrogateescape (not strict): a path holding undecodable bytes shows
+      // up in Python as lone surrogates, which a strict encoder rejects —
+      // leaving an exception pending that would later surface at an
+      // unrelated line (issue #1086).
+      auto enc = PyUnicode_AsEncodedString(scalene_pkg_path_obj, "utf-8",
+                                           "surrogateescape");
+      if (enc) {
+        scalene_pkg_path = std::string(PyBytes_AsString(enc));
+        Py_DecRef(enc);
+      } else {
+        PyErr_Clear();
+      }
+    } else {
+      scalene_pkg_path_owner = nullptr;
+    }
+  }
+
+  bool should_trace(char* filename) {
+    if (!filename) {
+      // Defensive programming.
+      return false;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(_memoizeMutex);
+      auto res = _memoize.find(filename);
+      if (res != _memoize.end()) {
+        return res->second;
+      }
+    }
+    // Return false if filename contains paths corresponding to the native
+    // Python libraries. This is to avoid profiling the Python interpreter
+    // itself. Also exclude site-packages and any IPython files.
+
+#if defined(_WIN32)
+    // If on Windows, use \\ as the path separator.
+    const auto PATH_SEP = "\\";
+#else
+    // Assume all others are POSIX.
+    const auto PATH_SEP = "/";
+#endif
+
+    // Always exclude Scalene's own files, regardless of profile_all.
+    //
+    // Two complementary checks run here:
+    //
+    //   1. Canonical-path prefix against the known scalene package
+    //      directory (captured at TraceConfig construction time from the
+    //      installed ``scalene.__file__``). This is the robust check: it
+    //      works even if the package has been renamed or vendored into a
+    //      parent directory that is not literally called "scalene".
+    //
+    //   2. The historical "immediate parent directory is literally
+    //      'scalene'" check. Kept as a defensive fallback for any path that
+    //      slips past #1 (e.g. a TraceConfig built by an older code path
+    //      that didn't pass scalene_pkg_path, or a resolved path on one
+    //      host being compared against a non-resolved path on another).
+    //
+    // Historical note: the previous "scalene/scalene" substring check
+    // also matched user paths like
+    // /home/runner/work/scalene/scalene/test/foo.py (the GitHub Actions
+    // checkout path for this very repo), which caused the stack walker to
+    // skip user frames and misattribute allocations to threading.py
+    // instead of issue_659_workload.py — see #659. The two-step check
+    // here preserves that fix.
+    if (!scalene_pkg_path.empty()) {
+      const size_t pkg_len = scalene_pkg_path.size();
+      if (strncmp(filename, scalene_pkg_path.c_str(), pkg_len) == 0) {
+        // Make sure we match on a path boundary so "/opt/scalene-thing.py"
+        // doesn't get excluded because the package lives at "/opt/scalene".
+        const char boundary = filename[pkg_len];
+        if (boundary == '/' || boundary == '\\' || boundary == '\0') {
+          std::lock_guard<std::mutex> lock(_memoizeMutex);
+          _memoize.insert(
+              std::pair<std::string, bool>(std::string(filename), false));
+          return false;
+        }
+      }
+    }
+    {
+      const char* last_slash = strrchr(filename, '/');
+      const char* last_bslash = strrchr(filename, '\\');
+      const char* last_sep =
+          (last_bslash && last_bslash > last_slash) ? last_bslash : last_slash;
+      if (last_sep) {
+        const char* prev_sep = nullptr;
+        for (const char* p = last_sep - 1; p >= filename; --p) {
+          if (*p == '/' || *p == '\\') {
+            prev_sep = p;
+            break;
+          }
+        }
+        const char* parent_start = prev_sep ? (prev_sep + 1) : filename;
+        size_t parent_len = (size_t)(last_sep - parent_start);
+        const char target[] = "scalene";
+        size_t target_len = sizeof(target) - 1;
+        if (parent_len == target_len &&
+            strncmp(parent_start, target, target_len) == 0) {
+          std::lock_guard<std::mutex> lock(_memoizeMutex);
+          _memoize.insert(
+              std::pair<std::string, bool>(std::string(filename), false));
+          return false;
+        }
+      }
+    }
+
+    if (!profile_all) {
+      auto python_lib =
+          std::string("lib") + std::string(PATH_SEP) + std::string("python");
+      auto anaconda_lib =
+          std::string("anaconda3") + std::string(PATH_SEP) + std::string("lib");
+
+      if (strstr(filename, python_lib.c_str()) ||
+          strstr(filename, anaconda_lib.c_str()) ||
+          strstr(filename, "site-packages") != nullptr ||
+          (strstr(filename, "<") &&
+           (strstr(filename, "<ipython") || strstr(filename, "<frozen")))) {
+        std::lock_guard<std::mutex> lock(_memoizeMutex);
+        _memoize.insert(
+            std::pair<std::string, bool>(std::string(filename), false));
+        return false;
+      }
+    }
+
+    if (owner != nullptr) {
+      for (const auto& traceable : items) {
+        if (strstr(filename, traceable.c_str())) {
+          std::lock_guard<std::mutex> lock(_memoizeMutex);
+          _memoize.insert(
+              std::pair<std::string, bool>(std::string(filename), true));
+          return true;
+        }
+      }
+    }
+
+    // Resolve relative filenames against the original program path.
+    // We avoid chdir() because it mutates process-wide state and is
+    // unsafe in free-threaded Python where multiple threads profile.
+    char resolved_path[PATH_MAX];
+    bool did_resolve_path = false;
+
+    if (filename[0] == '/' || filename[0] == '\\') {
+      // Absolute path — resolve directly
+      did_resolve_path = realpath(filename, resolved_path);
+    } else {
+      // Relative path — prepend scalene_base_path
+      std::string full_path = scalene_base_path + "/" + filename;
+      did_resolve_path = realpath(full_path.c_str(), resolved_path);
+    }
+
+    bool result = false;
+    if (did_resolve_path) {
+      // True if we found this file in the original path.
+      result = (strstr(resolved_path, scalene_base_path.c_str()) != nullptr);
+    }
+
+    std::lock_guard<std::mutex> lock(_memoizeMutex);
+    _memoize.insert(
+        std::pair<std::string, bool>(std::string(filename), result));
+    return result;
+  }
+
+  void print() {
+    printf("Profile all? %d\nitems {", profile_all);
+    for (const auto& c : items) {
+      printf("\t%s\n", c.c_str());
+    }
+    printf("}\n");
+  }
+
+  static void setInstance(TraceConfig* instance) {
+    std::lock_guard<decltype(_instanceMutex)> g(_instanceMutex);
+    delete _instance;
+    _instance = instance;
+  }
+
+  static TraceConfig* getInstance() {
+    std::lock_guard<decltype(_instanceMutex)> g(_instanceMutex);
+    return _instance;
+  }
+
+ private:
+  std::vector<std::string> items;
+  std::string scalene_base_path;
+  // Canonical path to the Scalene package directory. Empty when the
+  // caller did not supply one (legacy path). See should_trace().
+  std::string scalene_pkg_path;
+  // This is to keep the object in scope so that
+  // the data pointers are always valid
+  PyObject* owner;
+  PyObject* path_owner;
+  PyObject* scalene_pkg_path_owner;
+  bool profile_all;
+
+  static std::mutex _instanceMutex;
+  static std::mutex _memoizeMutex;
+  static TraceConfig* _instance;
+  static std::unordered_map<std::string, bool> _memoize;
+};
+
+#endif

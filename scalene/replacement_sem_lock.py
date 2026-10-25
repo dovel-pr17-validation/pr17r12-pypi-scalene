@@ -1,0 +1,67 @@
+import multiprocessing.context
+import multiprocessing.synchronize
+import random
+import sys
+import threading
+import warnings
+from typing import Any, Optional, Union
+
+from scalene.scalene_profiler import Scalene
+
+
+class ReplacementSemLock(multiprocessing.synchronize.Lock):
+    def __init__(
+        self,
+        ctx: Optional[
+            Union[
+                multiprocessing.context.DefaultContext,
+                multiprocessing.context.BaseContext,
+            ]
+        ] = None,
+    ) -> None:
+        # Ensure to use the appropriate context while initializing
+        if ctx is None:
+            ctx = multiprocessing.get_context()
+        # Store the context method for the BrokenPipeError fallback below.
+        self._ctx_method: Optional[str] = getattr(ctx, "_name", None)
+        try:
+            super().__init__(ctx=ctx)
+        except BrokenPipeError:
+            # On some systems (e.g., NixOS with Python 3.13+), the multiprocessing
+            # resource tracker subprocess can die unexpectedly when using spawn
+            # context, causing BrokenPipeError. Fall back to fork context on
+            # platforms where it's available.
+            # See: https://github.com/plasma-umass/scalene/issues/1017
+            if sys.platform != "win32" and self._ctx_method in ("spawn", "forkserver"):
+                warnings.warn(
+                    f"Multiprocessing resource tracker failed with {self._ctx_method!r} "
+                    f"context, falling back to 'fork' context. "
+                    f"See https://github.com/plasma-umass/scalene/issues/1017",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                ctx = multiprocessing.get_context("fork")
+                self._ctx_method = "fork"
+                super().__init__(ctx=ctx)
+            else:
+                raise
+
+    def __enter__(self) -> bool:
+        switch_interval = sys.getswitchinterval()
+        max_timeout = switch_interval
+        tident = threading.get_ident()
+        while True:
+            timeout = random.random() * max_timeout
+            Scalene.set_thread_sleeping(tident)
+            acquired = self._semlock.acquire(timeout=timeout)  # type: ignore
+            Scalene.reset_thread_sleeping(tident)
+            if acquired:
+                return True
+            else:
+                max_timeout *= 2  # Exponential backoff
+                # Cap timeout at 1 second
+                if max_timeout >= 1.0:
+                    max_timeout = 1.0
+
+    def __exit__(self, *args: Any) -> None:
+        super().__exit__(*args)
